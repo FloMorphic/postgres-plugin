@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/FloMorphic/postgres-plugin/internal/postgres"
@@ -106,25 +107,20 @@ func (r *Registry) createTable() sdkv1.Action {
 	return sdkv1.Action{
 		Method:      "postgres.table.create",
 		Title:       "Create Table (if not exists)",
-		Description: "Create a table only if it does not already exist. Give the table name and its column definitions; existing tables are left untouched.",
+		Description: "Create a table only if it does not already exist. Give it either PostgreSQL column definitions (with a table name) or a whole CREATE TABLE statement; existing tables are left untouched.",
 		Icon:        sdkv1.Icon{Icon: "mdi-table-plus"},
 		Form:        createTableForm,
 		RequestHandler: run(r, "create table", func(ctx context.Context, job *sdkv1.Job, client *postgres.Client, in createTableInput) (map[string]any, error) {
 			table := strings.TrimSpace(in.Table)
 			columns := strings.TrimSpace(in.Columns)
-			if table == "" || columns == "" {
-				return nil, fmt.Errorf("missing required input: %s", strings.Join(missing(in), ", "))
+			if columns == "" {
+				return nil, fmt.Errorf("missing required input: columns")
 			}
 
-			// The table name is an identifier, not a value, so it cannot be a
-			// bound parameter — it is quoted with pgx.Identifier, which rejects a
-			// name it cannot represent safely. The column definitions are DDL the
-			// author writes and are passed through as given.
-			ident := pgx.Identifier{table}
-			if schema := strings.TrimSpace(in.Schema); schema != "" {
-				ident = pgx.Identifier{schema, table}
+			ddl, err := buildCreateDDL(strings.TrimSpace(in.Schema), table, columns)
+			if err != nil {
+				return nil, err
 			}
-			ddl := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s)", ident.Sanitize(), columns)
 
 			job.Progress(50, sdkv1.Frame{Title: "create table", Content: preview(ddl)})
 
@@ -132,24 +128,55 @@ func (r *Registry) createTable() sdkv1.Action {
 			if err != nil {
 				return nil, err
 			}
-			return map[string]any{
-				"table":   strings.Trim(ident.Sanitize(), `"`),
-				"command": res.Command,
-				"ddl":     ddl,
-			}, nil
+			out := map[string]any{"command": res.Command, "ddl": ddl}
+			if table != "" {
+				out["table"] = table
+			}
+			return out, nil
 		}),
 	}
 }
 
-func missing(in createTableInput) []string {
-	var m []string
-	if strings.TrimSpace(in.Table) == "" {
-		m = append(m, "table")
+var (
+	// createTableRe matches the head of a CREATE TABLE statement up to (and
+	// including) the whitespace before the table name — so a whole statement can
+	// be told apart from a bare column list, and IF NOT EXISTS can be spliced in.
+	createTableRe = regexp.MustCompile(`(?i)^\s*CREATE\s+TABLE\s+`)
+	// ifNotExistsRe recognises a statement that is already idempotent, so the
+	// clause is never inserted twice.
+	ifNotExistsRe = regexp.MustCompile(`(?i)^\s*CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\b`)
+)
+
+// buildCreateDDL turns the form input into the statement to run. Two shapes are
+// accepted:
+//
+//   - A whole CREATE TABLE statement (what most people paste). It is run as
+//     given — full control over names, types, constraints — with IF NOT EXISTS
+//     spliced in when absent so re-running a flow stays a no-op, and a trailing
+//     semicolon trimmed (the extended protocol runs one statement).
+//   - Bare column definitions, the text inside the parentheses. These are wrapped
+//     as CREATE TABLE IF NOT EXISTS <table> (...), so a table name is required.
+//
+// The table name is an identifier, not a value, so it cannot be a bound
+// parameter — it is quoted with pgx.Identifier, which rejects a name it cannot
+// represent safely.
+func buildCreateDDL(schema, table, columns string) (string, error) {
+	if createTableRe.MatchString(columns) {
+		ddl := strings.TrimRight(columns, " \t\r\n;")
+		if !ifNotExistsRe.MatchString(ddl) {
+			ddl = createTableRe.ReplaceAllString(ddl, "CREATE TABLE IF NOT EXISTS ")
+		}
+		return ddl, nil
 	}
-	if strings.TrimSpace(in.Columns) == "" {
-		m = append(m, "columns")
+
+	if table == "" {
+		return "", fmt.Errorf("missing required input: table (needed when the definition is only columns, not a full CREATE TABLE statement)")
 	}
-	return m
+	ident := pgx.Identifier{table}
+	if schema != "" {
+		ident = pgx.Identifier{schema, table}
+	}
+	return fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s)", ident.Sanitize(), columns), nil
 }
 
 // ---------------------------------------------------------------- helpers --

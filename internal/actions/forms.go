@@ -63,9 +63,9 @@ var executeForm = formkit.New("Execute (write)").Add(
 ).Build()
 
 var createTableForm = formkit.New("Create table (if not exists)").Add(
-	formkit.Text("schema", "Schema").Describe("Optional, e.g. public. Empty uses the connection's search_path."),
-	formkit.Text("table", "Table name").Required().
-		Describe("Identifier only, e.g. events. It is quoted safely; do not include a schema here."),
-	formkit.TextArea("columns", "Column definitions").Required().
-		Describe(`The body of the parentheses, e.g. id bigserial primary key, name text not null, created_at timestamptz default now()`),
+	formkit.Text("schema", "Schema").Describe("Optional, e.g. public. Empty uses the connection's search_path. Used only with column definitions; ignored when you paste a full statement."),
+	formkit.Text("table", "Table name").
+		Describe("Identifier only, e.g. findings. Required when the definition below is only columns; not needed when you paste a full CREATE TABLE statement."),
+	formkit.TextArea("columns", "Column definitions or full statement").Required().
+		Describe(`Either a whole CREATE TABLE statement — CREATE TABLE findings (finding_id integer primary key, severity varchar(20) not null, ...) — or just the column definitions that go inside the parentheses — finding_id integer primary key, severity varchar(20) not null. This is SQL, not a JSON record. IF NOT EXISTS is applied for you.`),
 ).Build()

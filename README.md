@@ -16,6 +16,30 @@ databases and rotating a password needs no redeploy.
 | **Execute (write)** | `postgres.execute` | Runs an INSERT / UPDATE / DELETE and returns the command tag and affected count. Add `RETURNING` to also read rows back. |
 | **Create Table (if not exists)** | `postgres.table.create` | Creates a table only when it does not already exist; existing tables are left untouched. |
 
+## Create Table
+
+The definition field accepts **PostgreSQL SQL** in either shape:
+
+- **A whole `CREATE TABLE` statement** (what most people paste):
+  ```sql
+  CREATE TABLE findings (
+      finding_id   INTEGER PRIMARY KEY,
+      finding_name VARCHAR(255) NOT NULL,
+      severity     VARCHAR(20) NOT NULL,
+      created_at   TIMESTAMPTZ NOT NULL
+  );
+  ```
+  Run as given; the table-name field is not needed.
+- **Just the column definitions** — the text inside the parentheses — with the
+  table name supplied separately:
+  ```
+  finding_id integer primary key, finding_name varchar(255) not null, severity varchar(20) not null
+  ```
+
+Either way it's SQL, not a JSON record, and `IF NOT EXISTS` is applied so an
+existing table is left untouched. Creating a table makes it **empty** — inserting
+rows is the Execute action's job.
+
 ## Parameters, safely
 
 Never string-concatenate user input into SQL. Bind values with `$1, $2, …` and

@@ -2,6 +2,7 @@ package actions
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -51,6 +52,44 @@ func TestCoerceParam(t *testing.T) {
 		if got := coerceParam(c.in); got != c.want {
 			t.Errorf("coerceParam(%q) = %#v, want %#v", c.in, got, c.want)
 		}
+	}
+}
+
+func TestBuildCreateDDL(t *testing.T) {
+	// Bare column definitions are wrapped with the quoted, schema-qualified name.
+	got, err := buildCreateDDL("public", "findings", "id int primary key, name text")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `CREATE TABLE IF NOT EXISTS "public"."findings" (id int primary key, name text)`; got != want {
+		t.Errorf("columns mode:\n got %q\nwant %q", got, want)
+	}
+
+	// A full statement runs as given, gains IF NOT EXISTS, and loses its ';'.
+	full := "CREATE TABLE findings (\n  id integer primary key,\n  name varchar(255) not null\n);"
+	got, err = buildCreateDDL("", "findings", full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(got, "CREATE TABLE IF NOT EXISTS findings (") {
+		t.Errorf("full statement should gain IF NOT EXISTS, got %q", got)
+	}
+	if strings.HasSuffix(got, ";") {
+		t.Errorf("trailing semicolon should be trimmed, got %q", got)
+	}
+	if !strings.Contains(got, "varchar(255) not null") {
+		t.Errorf("body should be preserved, got %q", got)
+	}
+
+	// An already-idempotent statement is left untouched (no double clause).
+	idem := "create table if not exists findings (id int)"
+	if got, _ := buildCreateDDL("", "", idem); got != idem {
+		t.Errorf("idempotent statement changed:\n got %q\nwant %q", got, idem)
+	}
+
+	// Column-only definitions without a table name are an error.
+	if _, err := buildCreateDDL("", "", "id int"); err == nil {
+		t.Error("columns without a table name should error")
 	}
 }
 
