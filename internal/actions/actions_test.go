@@ -12,8 +12,8 @@ import (
 // not open.
 func TestFormsBuild(t *testing.T) {
 	r := New()
-	if got := len(r.All()); got != 3 {
-		t.Fatalf("want 3 actions, got %d", got)
+	if got := len(r.All()); got != 4 {
+		t.Fatalf("want 4 actions, got %d", got)
 	}
 	for _, a := range r.All() {
 		if a.Method == "" || a.RequestHandler == nil {
@@ -90,6 +90,69 @@ func TestBuildCreateDDL(t *testing.T) {
 	// Column-only definitions without a table name are an error.
 	if _, err := buildCreateDDL("", "", "id int"); err == nil {
 		t.Error("columns without a table name should error")
+	}
+}
+
+func TestResolveLimit(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    int
+		wantErr bool
+	}{
+		{"", 100, false},     // empty → default/ceiling
+		{"25", 25, false},    // within range
+		{"100", 100, false},  // the ceiling itself
+		{"5000", 100, false}, // clamped down to the ceiling
+		{"0", 100, false},    // non-positive → ceiling, never unlimited
+		{"-3", 100, false},   // negative → ceiling
+		{"  10 ", 10, false}, // surrounding space tolerated
+		{"{{$.n}}", 0, true}, // unresolved token is an error, not silently 0
+		{"lots", 0, true},    // non-numeric is an error
+	}
+	for _, c := range cases {
+		got, err := resolveLimit(c.in)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("resolveLimit(%q) = %d, want error", c.in, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("resolveLimit(%q) errored: %v", c.in, err)
+		} else if got != c.want {
+			t.Errorf("resolveLimit(%q) = %d, want %d", c.in, got, c.want)
+		}
+	}
+}
+
+func TestBuildUpsertDDL(t *testing.T) {
+	// Every PK column present → clash updates the non-key columns.
+	got := buildUpsertDDL("public", "findings", []string{"finding_id", "name", "severity"}, []string{"finding_id"})
+	want := `INSERT INTO "public"."findings" ("finding_id", "name", "severity") VALUES ($1, $2, $3) ` +
+		`ON CONFLICT ("finding_id") DO UPDATE SET "name" = EXCLUDED."name", "severity" = EXCLUDED."severity" RETURNING *`
+	if got != want {
+		t.Errorf("upsert:\n got %q\nwant %q", got, want)
+	}
+
+	// A composite key, and only the key columns supplied → clash is a no-op.
+	got = buildUpsertDDL("", "membership", []string{"org_id", "user_id"}, []string{"org_id", "user_id"})
+	want = `INSERT INTO "membership" ("org_id", "user_id") VALUES ($1, $2) ` +
+		`ON CONFLICT ("org_id", "user_id") DO NOTHING RETURNING *`
+	if got != want {
+		t.Errorf("key-only upsert:\n got %q\nwant %q", got, want)
+	}
+
+	// No primary key → plain insert.
+	got = buildUpsertDDL("", "logs", []string{"message"}, nil)
+	if want := `INSERT INTO "logs" ("message") VALUES ($1) RETURNING *`; got != want {
+		t.Errorf("no-pk insert:\n got %q\nwant %q", got, want)
+	}
+
+	// Serial key left out (not among the values) → nothing to conflict on, so a
+	// plain insert rather than an upsert.
+	got = buildUpsertDDL("", "events", []string{"name"}, []string{"id"})
+	if want := `INSERT INTO "events" ("name") VALUES ($1) RETURNING *`; got != want {
+		t.Errorf("serial-key insert:\n got %q\nwant %q", got, want)
 	}
 }
 

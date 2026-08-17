@@ -47,6 +47,7 @@ func (r *Registry) All() []sdkv1.Action {
 	return []sdkv1.Action{
 		r.query(),
 		r.execute(),
+		r.insert(),
 		r.createTable(),
 	}
 }

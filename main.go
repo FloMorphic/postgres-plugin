@@ -1,8 +1,8 @@
 // Command postgres-plugin is an Inflowenger plugin node for PostgreSQL.
 //
-// It exposes three actions on the workflow canvas — read a query, execute a
-// write, and create a table if it does not already exist — over a connection the
-// platform ships with every call.
+// It exposes four actions on the workflow canvas — read a query, execute a
+// write, insert or upsert a record, and create a table if it does not already
+// exist — over a connection the platform ships with every call.
 //
 // The plugin holds no database configuration. It declares what a connection
 // needs (see the settings form); the platform stores that as a named settings
@@ -25,7 +25,7 @@ const version = "v0.1.0"
 func main() {
 	envFile := os.Getenv("INFLOW_ENV_FILE")
 	if envFile == "" {
-		envFile = ".env.inflow"
+		envFile = ".env.inflow1"
 	}
 
 	// The dotenv carries the platform identity only — PLUGIN_ID, INFRA_CRED,

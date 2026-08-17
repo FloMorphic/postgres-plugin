@@ -1,5 +1,5 @@
 # Platform credentials — never commit
-.env.inflow
+.env.inflow*
 
 # Build output
 /postgres-plugin

@@ -104,4 +104,44 @@ func TestIntegration(t *testing.T) {
 	if _, ok := row["created_at"].(string); !ok {
 		t.Errorf("created_at = %#v, want an RFC3339 string", row["created_at"])
 	}
+
+	// 6. The Insert action's upsert path: discover the primary key, build the
+	//    ON CONFLICT statement, and run it against the row just inserted. The key
+	//    (finding_id = 2) already exists, so this must UPDATE rather than insert a
+	//    second row — the whole point of the upsert.
+	pk, err := client.PrimaryKeyColumns(ctx, "public.findings_it")
+	if err != nil {
+		t.Fatalf("primary key: %v", err)
+	}
+	if len(pk) != 1 || pk[0] != "finding_id" {
+		t.Fatalf("primary key = %v, want [finding_id]", pk)
+	}
+	cols := []string{"created_at", "description", "finding_id", "finding_name", "severity", "status"}
+	upsert := buildUpsertDDL("public", "findings_it", cols, pk)
+	t.Logf("upsert: %s", upsert)
+	up, err := client.Exec(ctx, upsert, []any{
+		"2026-08-16T11:00:00Z", "Now resolved.", int64(2), "Duplicate Records", "High", "Resolved",
+	})
+	if err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	if up.RowsAffected != 1 {
+		t.Fatalf("upsert affected %d rows, want 1", up.RowsAffected)
+	}
+
+	// The update must have landed, and there must still be exactly one row for
+	// the key — not a duplicate.
+	res, err = client.Query(ctx, `SELECT severity, status FROM public.findings_it WHERE finding_id = $1`, []any{int64(2)}, 100)
+	if err != nil {
+		t.Fatalf("re-read: %v", err)
+	}
+	if res.RowCount != 1 {
+		t.Fatalf("after upsert, key has %d rows, want 1", res.RowCount)
+	}
+	if got := res.Rows[0]["status"]; got != "Resolved" {
+		t.Errorf("status = %#v, want Resolved (upsert should have updated it)", got)
+	}
+	if got := res.Rows[0]["severity"]; got != "High" {
+		t.Errorf("severity = %#v, want High", got)
+	}
 }

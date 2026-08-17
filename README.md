@@ -12,9 +12,43 @@ databases and rotating a password needs no redeploy.
 
 | Action | Method | What it does |
 | --- | --- | --- |
-| **Run Query (read)** | `postgres.query` | Runs a SELECT (or any row-returning statement) and returns the rows, their column order, and a count. |
+| **Run Query (read)** | `postgres.query` | Runs a SELECT (or any row-returning statement) and returns the rows, their column order, and a count. Pull values from the flow inline with `{{$.path}}`. Returns **at most 100 rows**. |
 | **Execute (write)** | `postgres.execute` | Runs an INSERT / UPDATE / DELETE and returns the command tag and affected count. Add `RETURNING` to also read rows back. |
+| **Insert / Upsert record** | `postgres.record.insert` | Writes a row to a table from per-column fields or a JSON record. On a primary-key clash the existing row is **updated** (upsert). |
 | **Create Table (if not exists)** | `postgres.table.create` | Creates a table only when it does not already exist; existing tables are left untouched. |
+
+## Run Query (read)
+
+Just a **SQL** field and a **Max rows** field — no positional parameters. Pull
+values from the flow inline with `{{$.path}}`:
+
+```sql
+SELECT id, email FROM users WHERE org_id = '{{$.trigger.orgId}}' AND active = true
+```
+
+**Max rows** is capped at **100**: leave it blank for the default of 100, and any
+larger number (or a `{{$.path}}` token that resolves to one) is treated as 100.
+
+## Insert / Upsert record
+
+Write one row to a table, given one of two ways:
+
+- **Per-column fields.** The **Table** field has a single ↻ *Tables / columns*
+  button: press it with the box empty to list the tables, pick one, then press it
+  again to load that table's columns as value fields. Fill the ones you want; each
+  accepts a literal or a `{{$.path}}` token, and a blank column is omitted so its
+  default (or `SERIAL`) applies.
+- **A JSON record.** Paste a `{ "column": value }` object into **JSON record**; it
+  wins over the column fields when present. Values may be `{{$.path}}` tokens:
+  ```json
+  { "finding_id": 7, "severity": "high", "name": "{{$.event.title}}" }
+  ```
+
+The primary key is discovered automatically. When every key column is supplied,
+a clash becomes an `ON CONFLICT … DO UPDATE` of the other columns (a true
+upsert); when only the key is supplied, the clash is a no-op; with no usable key
+(none defined, or a serial one left out to be generated) it is a plain insert.
+Either way the written row comes back via `RETURNING *`.
 
 ## Create Table
 
@@ -117,5 +151,5 @@ settings profile, and run it.
 ```
 main.go                     wiring: intro, settings, actions, block after Start()
 internal/postgres/          connection profile → pgx pool → Query / Exec / Ping
-internal/actions/           the three actions, the {{JSONPATH}} resolver, forms, the connection-test meta
+internal/actions/           the four actions, the {{JSONPATH}} resolver, forms, the table/column + connection-test metas
 ```

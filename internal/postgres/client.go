@@ -148,6 +148,32 @@ func (c *Client) Exec(ctx context.Context, sql string, args []any) (ExecResult, 
 	return res, nil
 }
 
+// PrimaryKeyColumns returns the primary-key columns of a table, in key order, so
+// a write can turn a clash into an update. `qualified` is a table name, optionally
+// schema-qualified (public.findings); to_regclass resolves it against the
+// search_path and yields NULL for a table that does not exist, which comes back
+// as an empty key here — the write then runs as a plain insert and fails, if the
+// table really is missing, with the server's own clear "relation does not exist".
+func (c *Client) PrimaryKeyColumns(ctx context.Context, qualified string) ([]string, error) {
+	const sql = `SELECT a.attname AS column_name
+FROM pg_index i
+JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+WHERE i.indrelid = to_regclass($1) AND i.indisprimary
+ORDER BY array_position(i.indkey, a.attnum)`
+
+	res, err := c.Query(ctx, sql, []any{qualified}, 0)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read primary key of %s: %w", qualified, err)
+	}
+	pk := make([]string, 0, len(res.Rows))
+	for _, row := range res.Rows {
+		if name, ok := row["column_name"].(string); ok {
+			pk = append(pk, name)
+		}
+	}
+	return pk, nil
+}
+
 // commandWord is the leading verb of a command tag ("INSERT 0 3" → "INSERT").
 func commandWord(tag pgconn.CommandTag) string {
 	s := tag.String()

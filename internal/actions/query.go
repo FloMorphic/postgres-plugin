@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/FloMorphic/postgres-plugin/internal/postgres"
@@ -16,30 +18,33 @@ import (
 // ------------------------------------------------------------------- read --
 
 type queryInput struct {
-	SQL     string   `json:"sql"`
-	Params  []string `json:"params"`
-	MaxRows int      `json:"maxRows"`
+	SQL   string `json:"sql"`
+	Limit string `json:"limit"`
 }
+
+// maxRowLimit is the ceiling on how many rows a read returns. A larger request
+// is clamped to it rather than refused, and it is also the default.
+const maxRowLimit = 100
 
 func (r *Registry) query() sdkv1.Action {
 	return sdkv1.Action{
 		Method:      "postgres.query",
 		Title:       "Run Query (read)",
-		Description: "Run a SELECT (or any row-returning statement) and get the rows back. Use $1, $2 … for values, and {{$.path}} to pull them from the flow.",
+		Description: "Run a SELECT (or any row-returning statement) and get the rows back. Pull values from the flow inline with {{$.path}}. At most 100 rows are returned.",
 		Icon:        sdkv1.Icon{Icon: "mdi-database-search"},
 		Form:        queryForm,
 		RequestHandler: run(r, "query", func(ctx context.Context, job *sdkv1.Job, client *postgres.Client, in queryInput) (map[string]any, error) {
 			if strings.TrimSpace(in.SQL) == "" {
 				return nil, fmt.Errorf("missing required input: sql")
 			}
-			args, err := parseParams(in.Params)
+			limit, err := resolveLimit(in.Limit)
 			if err != nil {
 				return nil, err
 			}
 
 			job.Progress(50, sdkv1.Frame{Title: "query", Content: preview(in.SQL)})
 
-			res, err := client.Query(ctx, in.SQL, args, in.MaxRows)
+			res, err := client.Query(ctx, in.SQL, nil, limit)
 			if err != nil {
 				return nil, err
 			}
@@ -50,6 +55,25 @@ func (r *Registry) query() sdkv1.Action {
 			}, nil
 		}),
 	}
+}
+
+// resolveLimit turns the (already {{$.path}}-resolved) limit field into the row
+// cap to apply. Empty means the default; anything over the ceiling is clamped to
+// it, so a read never returns more than maxRowLimit rows. A non-number is an
+// error, since it is almost always an unresolved token the user meant to fill.
+func resolveLimit(raw string) (int, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return maxRowLimit, nil
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, fmt.Errorf("max rows must be a whole number up to %d: %q", maxRowLimit, s)
+	}
+	if n <= 0 || n > maxRowLimit {
+		return maxRowLimit, nil
+	}
+	return n, nil
 }
 
 // ------------------------------------------------------------------ write --
@@ -93,6 +117,195 @@ func (r *Registry) execute() sdkv1.Action {
 			return out, nil
 		}),
 	}
+}
+
+// --------------------------------------------------------- insert / upsert --
+
+// insertInput is a row to write, given one of two ways. The column fields loaded
+// into the form arrive under `values`; a pasted JSON object arrives as `record`
+// and, when present, wins.
+type insertInput struct {
+	Schema string         `json:"schema"`
+	Table  string         `json:"table"`
+	Values map[string]any `json:"values"`
+	Record string         `json:"record"`
+}
+
+func (r *Registry) insert() sdkv1.Action {
+	return sdkv1.Action{
+		Method:      "postgres.record.insert",
+		Title:       "Insert / Upsert record",
+		Description: "Write a row to a table from column fields or a JSON record. On a primary-key clash the existing row is updated instead of inserted (upsert). Values accept {{$.path}} tokens.",
+		Icon:        sdkv1.Icon{Icon: "mdi-table-row-plus-after"},
+		Form:        insertForm,
+		RequestHandler: run(r, "insert", func(ctx context.Context, job *sdkv1.Job, client *postgres.Client, in insertInput) (map[string]any, error) {
+			table := strings.TrimSpace(in.Table)
+			if table == "" {
+				return nil, fmt.Errorf("missing required input: table")
+			}
+			data, err := insertData(job, in)
+			if err != nil {
+				return nil, err
+			}
+			if len(data) == 0 {
+				return nil, fmt.Errorf("no column values: fill in at least one column field, or a JSON record")
+			}
+
+			schema := strings.TrimSpace(in.Schema)
+			qualified := table
+			if schema != "" {
+				qualified = schema + "." + table
+			}
+
+			// Discover the primary key so a clash can be turned into an update.
+			pk, err := client.PrimaryKeyColumns(ctx, qualified)
+			if err != nil {
+				return nil, err
+			}
+
+			cols := sortedMapKeys(data)
+			args := make([]any, len(cols))
+			for i, c := range cols {
+				args[i] = data[c]
+			}
+			upsert := len(pk) > 0 && subset(pk, cols)
+			sql := buildUpsertDDL(schema, table, cols, pk)
+
+			job.Progress(50, sdkv1.Frame{Title: "insert", Content: preview(sql)})
+
+			res, err := client.Exec(ctx, sql, args)
+			if err != nil {
+				return nil, err
+			}
+			out := map[string]any{
+				"command":      res.Command,
+				"rowsAffected": res.RowsAffected,
+				"table":        table,
+				"upsert":       upsert,
+			}
+			if len(res.Rows) > 0 {
+				out["columns"] = res.Columns
+				out["rows"] = res.Rows
+				out["row"] = res.Rows[0]
+			}
+			return out, nil
+		}),
+	}
+}
+
+// insertData turns the action's two input shapes into the column → value map to
+// write. A JSON record wins when present; otherwise the loaded column fields are
+// used, with each value resolved and typed the way a positional param is.
+func insertData(job *sdkv1.Job, in insertInput) (map[string]any, error) {
+	// A pasted record. Its {{$.path}} tokens were resolved by run() before it
+	// reached here, since Record is a plain string field, so it now parses as
+	// ordinary JSON. UseNumber keeps whole numbers off float64.
+	if rec := strings.TrimSpace(in.Record); rec != "" {
+		dec := json.NewDecoder(strings.NewReader(rec))
+		dec.UseNumber()
+		var obj map[string]any
+		if err := dec.Decode(&obj); err != nil {
+			return nil, fmt.Errorf("JSON record does not parse as an object: %w", err)
+		}
+		normalized, _ := normalizeNumbers(obj).(map[string]any)
+		return normalized, nil
+	}
+
+	// Column fields. run()'s reflect walker rewrites strings and []string on the
+	// input, but not the values inside this map, so resolve them here. A blank
+	// column is omitted so the column's default (or serial) applies.
+	vr := newVarResolver(job)
+	data := make(map[string]any, len(in.Values))
+	for col, raw := range in.Values {
+		s, ok := raw.(string)
+		if !ok {
+			if raw != nil {
+				data[col] = raw
+			}
+			continue
+		}
+		if s = strings.TrimSpace(vr.resolve(s)); s == "" {
+			continue
+		}
+		data[col] = coerceParam(s)
+	}
+	return data, nil
+}
+
+// buildUpsertDDL renders the write. Values are bound as $1…$n, never spliced in;
+// only the identifiers — the table and the column names — are put into the text,
+// each quoted with pgx.Identifier so a name it cannot represent safely is
+// rejected rather than injected.
+//
+// When every primary-key column is among the values supplied, a clash becomes an
+// UPDATE of the other columns (an upsert); when only the key is supplied, the
+// clash is a no-op. With no usable key — none defined, or a serial one left out
+// to be generated — there is nothing to conflict on, so it is a plain insert.
+func buildUpsertDDL(schema, table string, cols, pk []string) string {
+	ident := pgx.Identifier{table}
+	if schema != "" {
+		ident = pgx.Identifier{schema, table}
+	}
+
+	colIdents := make([]string, len(cols))
+	placeholders := make([]string, len(cols))
+	for i, c := range cols {
+		colIdents[i] = pgx.Identifier{c}.Sanitize()
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+	}
+	base := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
+		ident.Sanitize(), strings.Join(colIdents, ", "), strings.Join(placeholders, ", "))
+
+	if len(pk) == 0 || !subset(pk, cols) {
+		return base + " RETURNING *"
+	}
+
+	pkSet := make(map[string]bool, len(pk))
+	conflict := make([]string, len(pk))
+	for i, c := range pk {
+		conflict[i] = pgx.Identifier{c}.Sanitize()
+		pkSet[c] = true
+	}
+
+	assigns := make([]string, 0, len(cols))
+	for _, c := range cols {
+		if pkSet[c] {
+			continue // never overwrite the key with itself
+		}
+		q := pgx.Identifier{c}.Sanitize()
+		assigns = append(assigns, fmt.Sprintf("%s = EXCLUDED.%s", q, q))
+	}
+
+	if len(assigns) == 0 {
+		return fmt.Sprintf("%s ON CONFLICT (%s) DO NOTHING RETURNING *", base, strings.Join(conflict, ", "))
+	}
+	return fmt.Sprintf("%s ON CONFLICT (%s) DO UPDATE SET %s RETURNING *",
+		base, strings.Join(conflict, ", "), strings.Join(assigns, ", "))
+}
+
+// subset reports whether every element of sub is in super.
+func subset(sub, super []string) bool {
+	set := make(map[string]bool, len(super))
+	for _, s := range super {
+		set[s] = true
+	}
+	for _, s := range sub {
+		if !set[s] {
+			return false
+		}
+	}
+	return true
+}
+
+// sortedMapKeys orders a value map's keys, so the generated column list and the
+// bound arguments line up deterministically.
+func sortedMapKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // ----------------------------------------------------------- create table --
