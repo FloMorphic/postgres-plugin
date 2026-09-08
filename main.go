@@ -25,7 +25,7 @@ const version = "v0.1.0"
 func main() {
 	envFile := os.Getenv("INFLOW_ENV_FILE")
 	if envFile == "" {
-		envFile = ".env.inflow1"
+		envFile = ".env.inflow"
 	}
 
 	// The dotenv carries the platform identity only — PLUGIN_ID, INFRA_CRED,

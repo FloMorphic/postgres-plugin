@@ -3,7 +3,7 @@ module github.com/FloMorphic/postgres-plugin
 go 1.26.2
 
 require (
-	github.com/Inflowenger/go-plugin-sdk v0.1.7
+	github.com/Inflowenger/go-plugin-sdk v0.2.3
 	github.com/jackc/pgx/v5 v5.9.2
 )
 
